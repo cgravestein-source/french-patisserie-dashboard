@@ -142,16 +142,20 @@ const ADAPTERS = {
       const header = (report.Rows || []).find((r) => r.RowType === 'Header');
       if (header && header.Cells) cols = Math.max(1, header.Cells.length - 1);
       const revenue = new Array(cols).fill(0);
-      const cogs = new Array(cols).fill(0);
-      const wagesSuper = new Array(cols).fill(0);
-      const opex = new Array(cols).fill(0); /* all operating expenses incl wages */
+      const cogs = new Array(cols).fill(0);          /* Cost of Sales total, as-is */
+      const opex = new Array(cols).fill(0);          /* Operating Expenses total, incl its wages */
+      const wagesInCogs = new Array(cols).fill(0);   /* labour that sits inside Cost of Sales */
+      const wagesInOpex = new Array(cols).fill(0);   /* labour that sits inside Operating Expenses */
       const self = this;
 
       const classify = (title) => {
-        const t = (title || '').toLowerCase();
+        const t = (title || '').toLowerCase().trim();
+        /* ORDER MATTERS: test the specific sections before the generic 'sales'
+           catch, or 'Cost of Sales' would match the income rule. */
         if (/other income/.test(t)) return 'other';           /* excluded from revenue */
-        if (/income|revenue|turnover|sales/.test(t)) return 'income';
         if (/cost of (sales|goods)|cogs|direct cost/.test(t)) return 'cogs';
+        if (/gross profit|net profit|total /.test(t)) return null; /* summary sections */
+        if (/trading income|(^|\b)income\b|revenue|turnover|(^|\b)sales\b/.test(t)) return 'income';
         if (/operating expense|less operating|overhead|expense|administ/.test(t)) return 'opex';
         return null;
       };
@@ -163,20 +167,35 @@ const ADAPTERS = {
         for (const row of (section.Rows || [])) {
           if (row.RowType !== 'Row' || !row.Cells) continue;
           const name = row.Cells[0] && row.Cells[0].Value;
+          const isWage = self._isWageAccount(name);
           for (let c = 0; c < cols; c++) {
             const cell = row.Cells[c + 1];
             const val = cell ? num(cell.Value) : 0;
             if (kind === 'income') revenue[c] += val;
-            else if (kind === 'cogs') cogs[c] += val;
-            else if (kind === 'opex') {
-              opex[c] += val;
-              if (self._isWageAccount(name)) wagesSuper[c] += val;
-            }
+            else if (kind === 'cogs') { cogs[c] += val; if (isWage) wagesInCogs[c] += val; }
+            else if (kind === 'opex') { opex[c] += val; if (isWage) wagesInOpex[c] += val; }
           }
         }
       }
-      const overheads = opex.map((v, c) => v - wagesSuper[c]);
-      return { revenue, cogs, wagesSuper, overheads, cols };
+      /* Metric definitions for THIS venue's chart of accounts (Toowong French
+         Patisserie), settled with the owner at reconciliation (June 2026):
+         Kitchen labour (Wages Kitchen, Superannuation - Kitchen) is booked
+         INSIDE Cost of Sales; FOH/admin labour (Wages & Salaries, Superannuation)
+         is in Operating Expenses. The locked page computes
+         Profit = Revenue - COGS - wagesSuper - Overheads, so to avoid
+         double-counting the kitchen labour already inside COGS, `wagesSuper`
+         returned here is the OPERATING-EXPENSES labour only. Owner's choice:
+         keep Profit exactly right (reconciles to the P&L operating result);
+         Wage % therefore reflects FOH/admin labour, since kitchen labour is
+         already captured within Cost of goods.
+           - Cost of goods = Cost of Sales total, as booked  = cogs
+           - Overheads     = Operating Expenses total - its own labour
+           - wagesSuper    = Operating Expenses labour only (NOT kitchen labour)
+           - Profit (page) = Revenue - COGS - wagesSuper - Overheads
+                           = Revenue - COGS - OperatingExpensesTotal (exact) */
+      const wagesSuper = wagesInOpex.slice();
+      const overheads = opex.map((v, c) => v - wagesInOpex[c]);
+      return { revenue, cogs, wagesSuper, overheads, opexTotal: opex, cols };
     },
 
     async status(env, h) {
