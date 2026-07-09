@@ -41,7 +41,8 @@ id = "0282d710f8be4670b2152694a5b90686"
 #                        collects it in its wizard). No password => the dashboard
 #                        shows its set-password screen, never an open one.
 #   ACCOUNTING_CLIENT_ID / ACCOUNTING_CLIENT_SECRET   (OAuth accounting, e.g. Xero)
-#   POS_API_TOKEN                                     (pasted-token POS, e.g. Square)
+#   POS_CLIENT_ID / POS_CLIENT_SECRET                 (OAuth POS - Lightspeed O-Series/Kounta)
+#   POS_API_TOKEN                                     (pasted-token POS instead, e.g. Square)
 #   ROSTERING_API_TOKEN                               (pasted-token rostering, e.g. Deputy)
 #   INGEST_TOKEN                                      (only when a no-API rung is used:
 #                                                      a long random string; authorises

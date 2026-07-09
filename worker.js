@@ -260,13 +260,118 @@ const ADAPTERS = {
      POS_API_TOKEN); sandbox sign = token only answers on
      connect.squareupsandbox.com.
   */
+  /* WIRED: Lightspeed Restaurant POS (O-Series), aka Kounta. Supplies ONE
+     number: the count of COMPLETED transactions - no dollars ever. Read-only
+     OAuth2. Verified against current Kounta docs (apidoc.kounta.com,
+     o-series-support.lightspeedhq.com), July 2026:
+       - authorize: https://my.kounta.com/    token: https://api.kounta.com/v1/token.json
+       - the token endpoint wants client_id/client_secret in the POST BODY
+         (tokenAuth:'post'), NOT HTTP Basic (that is Xero's way, not Kounta's)
+       - access token lasts 1h; refresh token does NOT expire (shell refreshes)
+       - the authorised company: GET /v1/companies/me
+       - completed sales only: GET /v1/companies/{id}/orders/complete
+         (the /complete filter returns ONLY status COMPLETE - in-progress,
+         voided and cancelled orders are excluded by definition; refunds are
+         separate records and never reduce this count)
+       - date filter: ?created_gte=<ISO8601>&created_lte=<ISO8601> (UTC)
+       - pagination: 25 rows/page; follow the X-Next-Page response header
+         (a complete URL) until it is absent. We COUNT rows, we don't keep them.
+     Secrets: POS_CLIENT_ID, POS_CLIENT_SECRET. */
   pos: {
-    configured: false,
-    auth: null,
-    oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    configured: true,
+    auth: 'oauth',
+    oauth: {
+      authorizeUrl: 'https://my.kounta.com/',
+      tokenUrl: 'https://api.kounta.com/v1/token.json',
+      scopes: '',                        // Kounta grants company-level access; no scope string needed
+      clientIdSecret: 'POS_CLIENT_ID',
+      clientSecretSecret: 'POS_CLIENT_SECRET',
+      tokenAuth: 'post'                  // client id+secret go in the body (NOT Basic - that's Xero)
+    },
+
+    /* Resolve + cache the authorised company id (and name for the status line). */
+    async _companyId(env, h) {
+      const cached = await env.TOKENS.get('sys:pos_company');
+      if (cached) return cached;
+      const me = await h.fetchJson('https://api.kounta.com/v1/companies/me.json', { headers: { Accept: 'application/json' } });
+      const id = me && (me.id != null ? String(me.id) : null);
+      if (!id) throw new Error('no Kounta company on this connection');
+      await env.TOKENS.put('sys:pos_company', id);
+      await env.TOKENS.put('sys:pos_org', (me && (me.name || me.title)) || '');
+      return id;
+    },
+
+    /* Turn a venue-local trading day [from,to] (YYYY-MM-DD inclusive) into the
+       UTC ISO window Kounta wants, honouring q.tz and an r-hour day rollover.
+       from 00:00 (+rollover) local .. day-after-to 00:00 (+rollover) local. */
+    _isoWindow(q) {
+      const r = Math.max(0, Math.min(6, q.rollover || 0));
+      const startLocal = localWallToUtc(q.from, r, 0, q.tz);            // inclusive start
+      const endExclLocal = localWallToUtc(addDays(q.to, 1), r, 0, q.tz); // exclusive end (next trading day start)
+      /* created_lte is inclusive, so step back 1s to keep it exclusive-of-next-day */
+      const endIncl = new Date(endExclLocal.getTime() - 1000);
+      /* second-precision ISO, matching Kounta's documented examples (no millis) */
+      const iso = (d) => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+      return { gte: iso(startLocal), lte: iso(endIncl) };
+    },
+
+    /* Count COMPLETE orders in a UTC window, following X-Next-Page. */
+    async _countComplete(env, h, companyId, gteISO, lteISO) {
+      let url = 'https://api.kounta.com/v1/companies/' + companyId +
+        '/orders/complete.json?' + new URLSearchParams({ created_gte: gteISO, created_lte: lteISO }).toString();
+      let total = 0;
+      let guard = 0;
+      while (url && guard < 2000) {
+        guard++;
+        const token = await h.getValidAccessToken();
+        const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' } });
+        if (res.status === 401) { const e = new Error('HTTP 401'); e.status = 401; throw e; }
+        if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+        const rows = await res.json();
+        if (Array.isArray(rows)) total += rows.length;
+        const next = res.headers.get('X-Next-Page');
+        url = (next && next !== url) ? next : null;
+      }
+      return total;
+    },
+
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens) return { connected: false };
+      let org = await env.TOKENS.get('sys:pos_org');
+      try { await this._companyId(env, h); org = await env.TOKENS.get('sys:pos_org'); } catch (e) {}
+      /* Kounta O-Series has no separate sandbox host; there is no demo-org sign to flag. */
+      return { connected: true, org: org || null, sandbox: false, lastSync: await lastSync(env, 'pos') };
+    },
+
+    async fetchRange(env, h, q) {
+      const companyId = await this._companyId(env, h);
+      const w = this._isoWindow(q);
+      const count = await this._countComplete(env, h, companyId, w.gte, w.lte);
+      return { count: count };
+    },
+
+    async fetchMonthly(env, h, q) {
+      const companyId = await this._companyId(env, h);
+      const months = [];
+      let [y, m] = q.fromMonth.split('-').map(Number);
+      const [ey, em] = q.toMonth.split('-').map(Number);
+      while (y < ey || (y === ey && m <= em)) { months.push(y + '-' + String(m).padStart(2, '0')); m++; if (m > 12) { m = 1; y++; } }
+      const out = { months: months, count: [] };
+      for (const mo of months) {
+        const [yy, mm] = mo.split('-').map(Number);
+        const last = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
+        const from = mo + '-01';
+        const to = mo + '-' + String(last).padStart(2, '0');
+        try {
+          const w = this._isoWindow({ from: from, to: to, tz: q.tz, rollover: q.rollover });
+          out.count.push(await this._countComplete(env, h, companyId, w.gte, w.lte));
+        } catch (e) {
+          out.count.push(null);
+        }
+      }
+      return out;
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -654,6 +759,41 @@ async function saveIngestedRows(env, source, rows) {
     saved++;
   }
   return saved;
+}
+
+/* ---- Local-wall-clock -> UTC helpers (used by time-of-day POS adapters) ----
+   Workers ship a full ICU, so Intl.DateTimeFormat with a timeZone gives us the
+   zone's offset at any instant (incl. DST). localWallToUtc returns the UTC
+   Date that reads as <dateStr> <hh>:<mm> on the wall clock in <tz>. */
+function addDays(dateStr, n) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + n));
+  return dt.toISOString().slice(0, 10);
+}
+function tzOffsetMinutes(utcDate, tz) {
+  /* Minutes to ADD to UTC to get local wall time in tz at this instant. */
+  try {
+    const dtf = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    const parts = {};
+    for (const p of dtf.formatToParts(utcDate)) parts[p.type] = p.value;
+    let hh = parseInt(parts.hour, 10); if (hh === 24) hh = 0;
+    const asUTC = Date.UTC(+parts.year, +parts.month - 1, +parts.day, hh, +parts.minute, +parts.second);
+    return Math.round((asUTC - utcDate.getTime()) / 60000);
+  } catch (e) { return 0; /* unknown tz -> treat as UTC */ }
+}
+function localWallToUtc(dateStr, hour, minute, tz) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  /* First guess: pretend the wall time is UTC, then correct by the zone offset
+     at that instant. One re-check handles DST boundaries cleanly. */
+  const guess = new Date(Date.UTC(y, m - 1, d, hour, minute, 0));
+  const off1 = tzOffsetMinutes(guess, tz || 'UTC');
+  const corrected = new Date(guess.getTime() - off1 * 60000);
+  const off2 = tzOffsetMinutes(corrected, tz || 'UTC');
+  return off2 === off1 ? corrected : new Date(guess.getTime() - off2 * 60000);
 }
 
 function eachDate(from, to, cap) {
