@@ -129,5 +129,17 @@ still *say* "Connected" while this happens. Fix it like this:
 The registered reconnect address, for reference, is:
 `https://french-patisserie-dashboard.cgravestein.workers.dev/auth/accounting/callback`
 
+Your saved secret is stored in Cloudflare under `ACCOUNTING_CLIENT_SECRET`, and
+your Xero Client ID under `ACCOUNTING_CLIENT_ID` (`092F1C4C27DC4CBDB682154F976C1E3F`).
+
+---
+
+## Your current settings (set 11 Jul 2026)
+
+- **Timezone:** Brisbane
+- **Trading day:** Midnight (no rollover — a standard calendar day)
+- **Wage % target:** 40% (the Wage card turns amber above this — change it any
+  time on the Settings screen)
+
 Everything is read-only: the dashboard can only *look at* your Xero and till,
 never change anything.
