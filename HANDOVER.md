@@ -104,5 +104,30 @@ Nothing here touches any code. Click, and it saves.
   Reconnect.
 - Numbers look wrong — check the date range at the top first; then tell your AI.
 
+---
+
+## If ALL the numbers go blank ("no data yet" on every card)
+
+This usually means your **Xero app secret has expired** (Xero expires these
+periodically for security — expect it roughly once a year). The connection can
+still *say* "Connected" while this happens. Fix it like this:
+
+1. On the dashboard, click **Refresh** first — if that doesn't fix it, continue.
+2. Go to **https://developer.xero.com/app/manage** → open **French Patisserie
+   Dashboard** → **Configuration**.
+3. Under **Client secrets**, click **Generate a secret**. Copy the new secret
+   (shown once only).
+4. Go to **https://dash.cloudflare.com** → Workers & Pages →
+   **french-patisserie-dashboard** → **Settings** → **Variables and secrets**.
+5. Add/edit a **Secret** named `ACCOUNTING_CLIENT_SECRET`, paste the new value,
+   and click **Deploy**.
+6. Back on the dashboard: **Connections** → **Reconnect** next to Xero → log in
+   and allow access to Toowong French Patisserie.
+7. Numbers come straight back. (Or just paste the new secret to your AI and it
+   will walk you through steps 4–6.)
+
+The registered reconnect address, for reference, is:
+`https://french-patisserie-dashboard.cgravestein.workers.dev/auth/accounting/callback`
+
 Everything is read-only: the dashboard can only *look at* your Xero and till,
 never change anything.
