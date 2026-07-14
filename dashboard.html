@@ -1586,6 +1586,13 @@ function renderSettings(root) {
   });
   root.appendChild(tgrid);
 
+  root.appendChild(el('div', 'section-sub', 'Team access'));
+  var teamNote = el('div', 'set-note', 'Give each person on the team their own password instead of sharing one.');
+  root.appendChild(teamNote);
+  var teamBtn = el('button', 'btn-plain', 'Manage team passwords');
+  teamBtn.onclick = function () { location.href = '/team'; };
+  root.appendChild(teamBtn);
+
   if (!isManual()) {
     root.appendChild(el('div', 'section-sub', 'Session'));
     var logoutBtn = el('button', 'btn-plain', 'Log out');

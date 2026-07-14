@@ -520,21 +520,39 @@ function randomState() {
   return Array.from(a).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/* ---------------- Owner login: one passcode + a signed session cookie ----
+/* ---------------- Login: named passcodes + a signed session cookie ----------
    The owner sets the dashboard password on the dashboard's own FIRST-RUN screen;
-   it is stored PBKDF2-hashed in KV (sys:passcode_hash) - no Cloudflare Variables
-   step. (env.DASHBOARD_PASSCODE still works as an override, e.g. when the
-   one-click button collected it in its wizard.) The session-signing key is
-   generated and stored in KV on first run (env.SESSION_SECRET overrides if set).
-   Until a password exists the dashboard shows the SET-PASSWORD screen, never an
-   open page; once set, the page and every data route require a valid session. */
+   it (and any teammates added later) are stored PBKDF2-hashed in KV as a single
+   JSON map at sys:passcodes = { "<label>": "<saltHex>.<hashB64>", ... } - no
+   Cloudflare Variables step needed for day-to-day use. A legacy single-passcode
+   value at sys:passcode_hash (pre-dating multi-user support) is still honoured
+   as an implicit "owner" entry so nobody already logged in gets locked out.
+   env.DASHBOARD_PASSCODE, if set as a Cloudflare secret, is ALWAYS also a valid
+   master passcode alongside every named one - this doubles as a permanent,
+   self-service "forgot password" escape hatch: the owner can set/clear that one
+   secret from the Cloudflare dashboard (Settings > Variables and Secrets) any
+   time, with no code change or KV access needed, to regain entry.
+   The session-signing key is generated and stored in KV on first run
+   (env.SESSION_SECRET overrides if set). Until any passcode exists the
+   dashboard shows the SET-PASSWORD screen, never an open page; once set, the
+   page and every data route require a valid session. */
 const SESSION_TTL = 60 * 60 * 24 * 30;
-/* A password exists if the owner set one (first-run -> KV) or the deploy provided
-   one as an env override (the one-click button's wizard). */
+/* Load the named-passcode map, falling back to the legacy single-passcode key. */
+async function getPasscodes(env) {
+  if (!env.TOKENS) return {};
+  const raw = await env.TOKENS.get('sys:passcodes');
+  if (raw) { try { const m = JSON.parse(raw); if (m && typeof m === 'object') return m; } catch (e) {} }
+  const legacy = await env.TOKENS.get('sys:passcode_hash');
+  return legacy ? { owner: legacy } : {};
+}
+async function savePasscodes(env, map) {
+  await env.TOKENS.put('sys:passcodes', JSON.stringify(map));
+}
+/* A password exists if any named passcode is set, or the deploy provided one
+   as an env override (the one-click button's wizard / the recovery secret). */
 async function passcodeSet(env) {
   if (env.DASHBOARD_PASSCODE) return true;
-  if (env.TOKENS) return !!(await env.TOKENS.get('sys:passcode_hash'));
-  return false;
+  return Object.keys(await getPasscodes(env)).length > 0;
 }
 /* PBKDF2-SHA256 of a passcode with a hex salt -> base64url (at-rest hashing). */
 async function pbkdf2B64(passcode, saltHex) {
@@ -604,13 +622,18 @@ async function apiLogin(env, request) {
   let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
   const passcode = String((body && body.passcode) || '');
   let okPass = false;
+  /* The env override, when set, is ALWAYS a valid master passcode - checked
+     first but never exclusive, so it can coexist with named KV passcodes. */
   if (env.DASHBOARD_PASSCODE) {
     okPass = timingSafeEqual(await shaB64(passcode), await shaB64(env.DASHBOARD_PASSCODE));
-  } else if (env.TOKENS) {
-    const stored = await env.TOKENS.get('sys:passcode_hash');
-    if (stored) {
-      const dot = stored.indexOf('.');
-      okPass = timingSafeEqual(await pbkdf2B64(passcode, stored.slice(0, dot)), stored.slice(dot + 1));
+  }
+  if (!okPass) {
+    const map = await getPasscodes(env);
+    for (const label in map) {
+      const stored = map[label];
+      const dot = typeof stored === 'string' ? stored.indexOf('.') : -1;
+      if (dot < 0) continue;
+      if (timingSafeEqual(await pbkdf2B64(passcode, stored.slice(0, dot)), stored.slice(dot + 1))) { okPass = true; break; }
     }
   }
   if (!okPass) return json({ ok: false }, 401);
@@ -618,20 +641,65 @@ async function apiLogin(env, request) {
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'vd_session=' + encodeURIComponent(token) + '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=' + SESSION_TTL } });
 }
 
-/* First-run (or authenticated change): set the dashboard password. Allowed only
-   when none is set yet, OR when the caller already holds a valid session - so a
-   stranger can never overwrite an existing password. Stored PBKDF2-hashed in KV. */
+async function hashPasscode(passcode) {
+  const saltB = new Uint8Array(16); crypto.getRandomValues(saltB);
+  const saltHex = Array.from(saltB).map((x) => x.toString(16).padStart(2, '0')).join('');
+  return saltHex + '.' + (await pbkdf2B64(passcode, saltHex));
+}
+/* First-run: set the dashboard's first ("owner") password. Allowed only when
+   none is set yet, OR when the caller already holds a valid session - so a
+   stranger can never overwrite an existing password. Stored PBKDF2-hashed in
+   KV under the named-passcode map (label "owner"). */
 async function apiSetup(env, request) {
   if (!env.TOKENS) return json({ ok: false, error: 'no_store' }, 400);
   if ((await passcodeSet(env)) && !(await isLoggedIn(request, env))) return json({ ok: false, error: 'exists' }, 403);
   let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
   const passcode = String((body && body.passcode) || '');
   if (passcode.length < 6) return json({ ok: false, error: 'too_short' }, 400);
-  const saltB = new Uint8Array(16); crypto.getRandomValues(saltB);
-  const saltHex = Array.from(saltB).map((x) => x.toString(16).padStart(2, '0')).join('');
-  await env.TOKENS.put('sys:passcode_hash', saltHex + '.' + (await pbkdf2B64(passcode, saltHex)));
+  const map = await getPasscodes(env);
+  map.owner = await hashPasscode(passcode);
+  await savePasscodes(env, map);
   const token = await makeSession(env);
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'vd_session=' + encodeURIComponent(token) + '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=' + SESSION_TTL } });
+}
+
+/* ---------------- Team access: named passcodes, added/removed once logged in
+   ------------------------------------------------------------------------
+   Lets whoever is already signed in give teammates their OWN password instead
+   of sharing one. Every route here requires an existing valid session - a
+   stranger who doesn't already have a working passcode can never add one. */
+const LABEL_RE = /^[a-zA-Z0-9][a-zA-Z0-9 _.'-]{0,39}$/;
+async function apiTeamList(env, request) {
+  if (!(await isLoggedIn(request, env))) return json({ error: 'auth' }, 401);
+  const map = await getPasscodes(env);
+  return json({ ok: true, labels: Object.keys(map).sort() });
+}
+async function apiTeamSet(env, request) {
+  if (!(await isLoggedIn(request, env))) return json({ error: 'auth' }, 401);
+  if (!env.TOKENS) return json({ ok: false, error: 'no_store' }, 400);
+  let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
+  const label = String((body && body.label) || '').trim();
+  const passcode = String((body && body.passcode) || '');
+  if (!LABEL_RE.test(label)) return json({ ok: false, error: 'bad_label' }, 400);
+  if (passcode.length < 6) return json({ ok: false, error: 'too_short' }, 400);
+  const map = await getPasscodes(env);
+  map[label] = await hashPasscode(passcode);
+  await savePasscodes(env, map);
+  return json({ ok: true, labels: Object.keys(map).sort() });
+}
+async function apiTeamRemove(env, request) {
+  if (!(await isLoggedIn(request, env))) return json({ error: 'auth' }, 401);
+  if (!env.TOKENS) return json({ ok: false, error: 'no_store' }, 400);
+  let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
+  const label = String((body && body.label) || '').trim();
+  const map = await getPasscodes(env);
+  /* Never allow removing the last remaining passcode - that would lock
+     everyone out with no set-password screen to recover through (unless
+     env.DASHBOARD_PASSCODE is set as a backstop, which we can't assume). */
+  if (Object.keys(map).length <= 1) return json({ ok: false, error: 'last_one' }, 400);
+  delete map[label];
+  await savePasscodes(env, map);
+  return json({ ok: true, labels: Object.keys(map).sort() });
 }
 function apiLogout() {
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'vd_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0' } });
@@ -687,6 +755,52 @@ function setupPage() {
     + 'fetch("/api/setup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({passcode:p})})'
     + '.then(function(r){if(r.ok){location.reload();}else{e.textContent="Could not save that. Try again.";}})'
     + '.catch(function(){e.textContent="Something went wrong. Try again.";});};'
+    + '</script></body></html>';
+}
+
+function teamPage() {
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Team access</title>'
+    + '<link href="https://fonts.googleapis.com/css2?family=Khand:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">'
+    + '<style>'
+    + 'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#FAF7F2;font-family:"DM Sans",sans-serif;color:#2A2420;padding:24px 0}'
+    + '.box{width:90%;max-width:420px;background:#fffdf9;border:1px solid rgba(13,13,13,0.08);border-radius:16px;padding:2rem 1.75rem}'
+    + 'h1{font-family:"Khand",sans-serif;font-size:28px;font-weight:700;color:#0D0D0D;margin:0 0 0.4rem}'
+    + 'p{font-size:14px;color:#8C8075;margin:0 0 1.25rem;line-height:1.6}'
+    + 'input{width:100%;font-family:"DM Sans",sans-serif;font-size:15px;padding:12px 14px;border:1px solid rgba(13,13,13,0.14);border-radius:10px;background:#fff;color:#2A2420;box-sizing:border-box}'
+    + 'input:focus{outline:none;border-color:#F2A900}'
+    + 'button{width:100%;margin-top:12px;padding:13px;font-size:15px;font-weight:500;font-family:"DM Sans",sans-serif;color:#0D0D0D;background:#F2A900;border:none;border-radius:10px;cursor:pointer}'
+    + '.ghost{background:transparent;border:1px solid rgba(13,13,13,0.14);color:#2A2420;margin-top:8px}'
+    + '.err{color:#C04B28;font-size:13px;margin-top:10px;min-height:16px}'
+    + '.list{list-style:none;margin:0 0 1.25rem;padding:0}'
+    + '.list li{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid rgba(13,13,13,0.08);border-radius:10px;margin-bottom:8px;font-size:14px}'
+    + '.list button{width:auto;margin:0;padding:6px 12px;font-size:12px;background:#fff;border:1px solid rgba(192,75,40,0.4);color:#C04B28;border-radius:8px}'
+    + 'a{color:#8C8075;font-size:13px;text-decoration:none}'
+    + '</style></head><body>'
+    + '<div class="box"><h1>Team access</h1><p>Give each teammate their own password instead of sharing one. Anyone listed below can sign in with theirs.</p>'
+    + '<ul class="list" id="list"><li>Loading...</li></ul>'
+    + '<form id="f"><input id="label" placeholder="Name (e.g. Kate)" autocomplete="off">'
+    + '<input id="p" type="password" autocomplete="new-password" placeholder="Their password (6+ characters)" style="margin-top:10px">'
+    + '<button type="submit">Add / update this person</button><div class="err" id="e"></div></form>'
+    + '<div style="margin-top:14px"><a href="/">&larr; Back to dashboard</a></div></div>'
+    + '<script>'
+    + 'function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];});}'
+    + 'function load(){fetch("/api/team").then(function(r){return r.json();}).then(function(d){'
+    + 'var l=document.getElementById("list");if(!d.labels||!d.labels.length){l.innerHTML="<li>Nobody yet.</li>";return;}'
+    + 'l.innerHTML=d.labels.map(function(name){return "<li><span>"+esc(name)+"</span><button data-name=\""+esc(name)+"\">Remove</button></li>";}).join("");'
+    + 'Array.prototype.forEach.call(l.querySelectorAll("button"),function(b){b.onclick=function(){remove(b.getAttribute("data-name"));};});'
+    + '});}'
+    + 'function remove(name){if(!confirm("Remove "+name+"\u2019s password?"))return;'
+    + 'fetch("/api/team/remove",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({label:name})})'
+    + '.then(function(r){return r.json();}).then(function(d){if(d.ok){load();}else{alert("Could not remove that person (at least one passcode must remain).");}});}'
+    + 'var f=document.getElementById("f");'
+    + 'f.onsubmit=function(ev){ev.preventDefault();var e=document.getElementById("e");e.textContent="";'
+    + 'var label=document.getElementById("label").value.trim(),p=document.getElementById("p").value;'
+    + 'if(!label){e.textContent="Enter a name.";return;}'
+    + 'if(p.length<6){e.textContent="Use at least 6 characters.";return;}'
+    + 'fetch("/api/team/set",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({label:label,passcode:p})})'
+    + '.then(function(r){return r.json();}).then(function(d){if(d.ok){document.getElementById("label").value="";document.getElementById("p").value="";load();}else{e.textContent="Could not save that. Use a simple name and a 6+ character password.";}})'
+    + '.catch(function(){e.textContent="Something went wrong. Try again.";});};'
+    + 'load();'
     + '</script></body></html>';
 }
 
@@ -1042,6 +1156,13 @@ export default {
       if (loggedIn) return htmlResponse(dashboardHtml);
       return htmlResponse((await passcodeSet(env)) ? loginPage() : setupPage());
     }
+    if (path === '/team') {
+      if (!loggedIn) return Response.redirect(url.origin + '/', 302);
+      return htmlResponse(teamPage());
+    }
+    if (path === '/api/team' && request.method === 'GET') return apiTeamList(env, request);
+    if (path === '/api/team/set' && request.method === 'POST') return apiTeamSet(env, request);
+    if (path === '/api/team/remove' && request.method === 'POST') return apiTeamRemove(env, request);
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
