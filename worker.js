@@ -344,33 +344,83 @@ const ADAPTERS = {
       return { connected: true, org: org || null, sandbox: false, lastSync: await lastSync(env, 'pos') };
     },
 
+    /* Live-first, no-API-second: if a live Kounta connection exists, use it
+       (falling back to any uploaded/manual counts only if the live call
+       itself fails). If there is no live connection at all (the owner's
+       current state - Lightspeed wants a paid plan for API access), read
+       whatever counts have been typed in / uploaded via /api/ingest instead.
+       Never invent a number: if neither source has data, stay honest. */
     async fetchRange(env, h, q) {
-      const companyId = await this._companyId(env, h);
-      const w = this._isoWindow(q);
-      const count = await this._countComplete(env, h, companyId, w.gte, w.lte);
-      return { count: count };
+      const tokens = await h.getTokens();
+      if (tokens) {
+        try {
+          const companyId = await this._companyId(env, h);
+          const w = this._isoWindow(q);
+          const count = await this._countComplete(env, h, companyId, w.gte, w.lte);
+          return { count: count };
+        } catch (liveErr) {
+          const ing = await h.readIngested(q.from, q.to);
+          if (ing.daysWithData > 0) return { count: ing.sums.count || 0 };
+          throw liveErr;
+        }
+      }
+      const ing = await h.readIngested(q.from, q.to);
+      if (ing.daysWithData > 0) return { count: ing.sums.count || 0 };
+      throw new NotConfigured('pos');
     },
 
     async fetchMonthly(env, h, q) {
-      const companyId = await this._companyId(env, h);
-      const months = [];
-      let [y, m] = q.fromMonth.split('-').map(Number);
-      const [ey, em] = q.toMonth.split('-').map(Number);
-      while (y < ey || (y === ey && m <= em)) { months.push(y + '-' + String(m).padStart(2, '0')); m++; if (m > 12) { m = 1; y++; } }
-      const out = { months: months, count: [] };
-      for (const mo of months) {
-        const [yy, mm] = mo.split('-').map(Number);
-        const last = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
-        const from = mo + '-01';
-        const to = mo + '-' + String(last).padStart(2, '0');
+      const tokens = await h.getTokens();
+      if (tokens) {
         try {
-          const w = this._isoWindow({ from: from, to: to, tz: q.tz, rollover: q.rollover });
-          out.count.push(await this._countComplete(env, h, companyId, w.gte, w.lte));
+          const companyId = await this._companyId(env, h);
+          const months = [];
+          let [y, m] = q.fromMonth.split('-').map(Number);
+          const [ey, em] = q.toMonth.split('-').map(Number);
+          while (y < ey || (y === ey && m <= em)) { months.push(y + '-' + String(m).padStart(2, '0')); m++; if (m > 12) { m = 1; y++; } }
+          const out = { months: months, count: [] };
+          for (const mo of months) {
+            const [yy, mm] = mo.split('-').map(Number);
+            const last = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
+            const from = mo + '-01';
+            const to = mo + '-' + String(last).padStart(2, '0');
+            try {
+              const w = this._isoWindow({ from: from, to: to, tz: q.tz, rollover: q.rollover });
+              out.count.push(await this._countComplete(env, h, companyId, w.gte, w.lte));
+            } catch (e) {
+              const ing = await h.readIngested(from, to);
+              out.count.push(ing.daysWithData > 0 ? (ing.sums.count || 0) : null);
+            }
+          }
+          return out;
         } catch (e) {
-          out.count.push(null);
+          /* company resolution itself failed - fall through to ingested-only below */
         }
       }
-      return out;
+      const ing = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return { months: ing.months, count: ing.byMonth.map(function (m) { return m ? (m.count || 0) : null; }) };
+    },
+
+    /* No-API rung: the owner types the daily sales Count shown on Lightspeed's
+       own Reports > Dashboard screen (Back Office > Reports; pick one day at
+       a time, read the "Count" figure) into a small text file, one day per
+       line, e.g.:
+         2026-07-15,157
+         2026-07-14,132
+       and uploads it via the Connections screen. Loose on purpose: any line
+       with a YYYY-MM-DD date followed by a whole number is accepted, so
+       "date,count" headers, commas, colons or spaces all just work. */
+    async parseExport(env, h, raw) {
+      const text = String((raw && raw.text) || '');
+      const lineRe = /(\d{4}-\d{2}-\d{2})\D+(\d+)/;
+      const rows = [];
+      text.split(/\r?\n/).forEach(function (line) {
+        line = line.trim();
+        if (!line) return;
+        const m = lineRe.exec(line);
+        if (m) rows.push({ date: m[1], count: parseInt(m[2], 10) });
+      });
+      return rows;
     }
   },
 
