@@ -617,15 +617,35 @@ async function isLoggedIn(request, env) {
 function htmlResponse(html) {
   return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer' } });
 }
+/* Append one login attempt (success or failure) to a rolling KV log, so a
+   weekly report can flag unusual patterns (e.g. one IP with many failures).
+   Kept to the last 45 days / 3000 entries - never lets a logging error break
+   an actual login. */
+async function logLoginAttempt(env, request, ok, label) {
+  if (!env.TOKENS) return;
+  try {
+    const ip = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown';
+    const raw = await env.TOKENS.get('sys:login_log');
+    let list = [];
+    if (raw) { try { const p = JSON.parse(raw); if (Array.isArray(p)) list = p; } catch (e) {} }
+    list.push({ ts: new Date().toISOString(), ip, ok: !!ok, label: label || null });
+    const cutoff = Date.now() - 45 * 24 * 60 * 60 * 1000;
+    list = list.filter((e) => { const t = Date.parse(e.ts); return !isNaN(t) && t >= cutoff; });
+    if (list.length > 3000) list = list.slice(list.length - 3000);
+    await env.TOKENS.put('sys:login_log', JSON.stringify(list));
+  } catch (e) { /* logging must never block a real login */ }
+}
 async function apiLogin(env, request) {
   if (!(await passcodeSet(env))) return json({ ok: false, error: 'no_passcode' }, 400);
   let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
   const passcode = String((body && body.passcode) || '');
   let okPass = false;
+  let matchedLabel = null;
   /* The env override, when set, is ALWAYS a valid master passcode - checked
      first but never exclusive, so it can coexist with named KV passcodes. */
   if (env.DASHBOARD_PASSCODE) {
     okPass = timingSafeEqual(await shaB64(passcode), await shaB64(env.DASHBOARD_PASSCODE));
+    if (okPass) matchedLabel = 'master-override';
   }
   if (!okPass) {
     const map = await getPasscodes(env);
@@ -633,14 +653,38 @@ async function apiLogin(env, request) {
       const stored = map[label];
       const dot = typeof stored === 'string' ? stored.indexOf('.') : -1;
       if (dot < 0) continue;
-      if (timingSafeEqual(await pbkdf2B64(passcode, stored.slice(0, dot)), stored.slice(dot + 1))) { okPass = true; break; }
+      if (timingSafeEqual(await pbkdf2B64(passcode, stored.slice(0, dot)), stored.slice(dot + 1))) { okPass = true; matchedLabel = label; break; }
     }
   }
+  await logLoginAttempt(env, request, okPass, matchedLabel);
   if (!okPass) return json({ ok: false }, 401);
   const token = await makeSession(env);
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'vd_session=' + encodeURIComponent(token) + '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=' + SESSION_TTL } });
 }
 
+/* Machine-only endpoint for the weekly login-security report. Guarded by a
+   dedicated secret (env.REPORT_API_KEY) that is DELIBERATELY separate from
+   every dashboard passcode - this key can only ever read the login log, it
+   can never be used to sign in to the dashboard itself. Returns recent
+   login attempts (ip, timestamp, success/fail, matched label), optionally
+   filtered with ?since=<ISO timestamp>. */
+async function apiSecurityLog(env, request, url) {
+  if (!env.REPORT_API_KEY) return json({ ok: false, error: 'not_configured' }, 501);
+  const auth = request.headers.get('authorization') || '';
+  const expected = 'Bearer ' + env.REPORT_API_KEY;
+  if (!timingSafeEqual(await shaB64(auth), await shaB64(expected))) return json({ ok: false, error: 'auth' }, 401);
+  let list = [];
+  if (env.TOKENS) {
+    const raw = await env.TOKENS.get('sys:login_log');
+    if (raw) { try { const p = JSON.parse(raw); if (Array.isArray(p)) list = p; } catch (e) {} }
+  }
+  const since = url.searchParams.get('since');
+  if (since) {
+    const sinceMs = Date.parse(since);
+    if (!isNaN(sinceMs)) list = list.filter((e) => { const t = Date.parse(e.ts); return !isNaN(t) && t >= sinceMs; });
+  }
+  return json({ ok: true, entries: list });
+}
 async function hashPasscode(passcode) {
   const saltB = new Uint8Array(16); crypto.getRandomValues(saltB);
   const saltHex = Array.from(saltB).map((x) => x.toString(16).padStart(2, '0')).join('');
@@ -1163,6 +1207,7 @@ export default {
     if (path === '/api/team' && request.method === 'GET') return apiTeamList(env, request);
     if (path === '/api/team/set' && request.method === 'POST') return apiTeamSet(env, request);
     if (path === '/api/team/remove' && request.method === 'POST') return apiTeamRemove(env, request);
+    if (path === '/api/security-log' && request.method === 'GET') return apiSecurityLog(env, request, url);
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
