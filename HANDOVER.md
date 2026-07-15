@@ -53,12 +53,17 @@ setup, and it means Profit reconciles to your Xero P&L to the cent.
 
 - ✅ **Xero (accounting)** — live. All money figures. Reconciled to your June
   P&L to the cent.
-- ⏳ **Lightspeed (till / sales count)** — built and ready, waiting on Lightspeed
-  to switch on API access for your account (you emailed developers@kounta.com).
-  When they reply and enable it: create an Integration in your Lightspeed Back
-  Office, and your AI will paste the two codes in — a two-minute job. Until then,
-  the Transactions and Average Customer Spend cards show "not configured" (never
-  a fake number).
+- 📝 **Lightspeed (till / sales count)** — Lightspeed quoted **$100/month** for
+  live API access, so instead of paying, the Transactions and Average Customer
+  Spend cards run on a **free manual entry** you top up weekly: in Lightspeed
+  Back Office → Reports → Dashboard, pick a day and read the "Count" number, then
+  type `date,count` lines (one per day) into a small text file and upload it on
+  the dashboard's **Connections** screen (Lightspeed card → the file-upload box).
+  Xero revenue ÷ that count is what drives Average Customer Spend — no separate
+  wiring needed. If a day has no upload yet, the cards show "not configured"
+  (never a fake number). If you ever decide the $100/month live link is worth it
+  after all, the automatic-connection code is still there and ready — say so and
+  it's a two-minute swap, no rebuild required.
 - ➖ **Urhere (rostering)** — nothing to connect. Urhere doesn't offer a live
   link for other tools to read from; it sends your timesheets straight into Xero
   instead. That means your **Wage % is already covered by Xero**. The only extra
@@ -81,9 +86,28 @@ Nothing here touches any code. Click, and it saves.
 
 ---
 
-## When the Lightspeed email comes back
+## Your weekly Lightspeed manual entry (free path)
 
-1. Lightspeed enables API access → the **Create a new Integration** button
+1. In Lightspeed Back Office, go to **Reports → Dashboard**.
+2. Pick one day at a time in the date selector and note the **Count** number
+   shown (this is the number of completed sales for that day).
+3. In a plain text file, add one line per day: `2026-07-15,157`
+4. Open your dashboard's **Connections** screen, find the Lightspeed card, and
+   drop the file into its upload box (it asks for the upload code your AI gave
+   you when this was set up — keep that code somewhere safe, like a password
+   manager).
+5. Do this weekly (or whenever convenient) covering the days since your last
+   upload — re-uploading a day you already entered just corrects it, it never
+   double-counts.
+
+---
+
+## If you decide to pay for the live Lightspeed link later
+
+Lightspeed's API access is a paid add-on ($100/month at time of writing). If you
+change your mind and buy it:
+
+1. Ask Lightspeed to enable API access → the **Create a new Integration** button
    appears in your Back Office (under Sites → Integrations, developer area).
 2. Create one named "Dashboard", set its Redirect address to:
    `https://french-patisserie-dashboard.cgravestein.workers.dev/auth/pos/callback`
